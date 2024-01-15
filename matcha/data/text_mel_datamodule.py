@@ -5,12 +5,41 @@ import torch
 import torchaudio as ta
 from lightning import LightningDataModule
 from torch.utils.data.dataloader import DataLoader
+import onnxruntime
+import numpy as np
+
+
+from onnxruntime import set_seed
 
 from matcha.text import text_to_sequence
 from matcha.utils.audio import mel_spectrogram
 from matcha.utils.model import fix_len_compatibility, normalize
 from matcha.utils.utils import intersperse
 
+
+class SSLFeatureExtractor:
+    def __init__(self, vec_path="/content/drive/MyDrive/Models/placeWhereYourFeatureExtractorLives.onnx", device=None):
+        print("load model(s) from {}".format(vec_path))
+        if device == "cpu" or device is None:
+            providers = ["CPUExecutionProvider"]
+        else:
+            raise RuntimeError("Unsportted Device")
+        self.model = onnxruntime.InferenceSession(vec_path, providers=providers)
+
+    def __call__(self, wav):
+        return self.forward(wav)
+
+    def forward(self, wav):
+        feats = wav
+        print(feats.shape)
+        if feats.ndim == 2:  # double channels
+            feats = feats.mean(-1)
+        assert feats.ndim == 1, feats.ndim
+        feats = np.expand_dims(np.expand_dims(feats, 0), 0)
+        print(feats.shape)
+        onnx_input = {self.model.get_inputs()[0].name: feats}
+        logits = self.model.run(None, onnx_input)[0]
+        return logits.transpose(0, 2, 1)
 
 def parse_filelist(filelist_path, split_char="|"):
     with open(filelist_path, encoding="utf-8") as f:
@@ -193,20 +222,26 @@ class TextMelDataset(torch.utils.data.Dataset):
     def get_ssl(self, filepath):
         audio, sr = ta.load(filepath)
         assert sr == self.sample_rate
+        ssl_model = SSLFeatureExtractor("./vecpath.onnx")
         # Resample to 16khz, feed through model, return vec of (Frames X 256), where frame is 10ms.
         # these are stand in functions for now, just trying to get a feel for what needs to happen/change.
-        ssl = SSLFeatureExtractor(audio
-        ).squeeze()
-        #ssl = normalize(mel, self.data_parameters["mel_mean"], self.data_parameters["mel_std"])
+        ssl = ssl_model(audio
+        )
+        # shape will be (1, N, 256), this needs converting/squeeze the 1, rearrange to format Matcha wants, N would be frames over time,
+        # 256 would be depth, this could be generalised further? Like either that number inferred from depth of network, or macro param?
+        # ssl = normalize(mel, self.data_parameters["mel_mean"], self.data_parameters["mel_std"])
+        # Would we still normalise if we're using embeddings? 
         return ssl
 
     def get_ssl_F0(self, filepath):
         audio, sr = ta.load(filepath)
         assert sr == self.sample_rate
+        ssl_model = SSLFeatureExtractor("./vecpath.onnx")
         # Resample to 16khz, feed through model, return vec of (Frames X 256), where frame is 10ms.
-        ssl = SSLFeatureExtractor(audio
-        ).squeeze()
+        ssl = ssl_model(audio
+        ).squeeze() #?? Do we just squeeze? I'd rather make sure array was orientated correctly before squeezing.
         #ssl = normalize(mel, self.data_parameters["mel_mean"], self.data_parameters["mel_std"])
+        # Do similar thing, load RMPVE neural pitch tracker via onnx, extract, filter out extra frames, align to same time len
         F0 = F0featureExtractor(audio)
         return ssl, F0
 

@@ -16,7 +16,8 @@ from matcha.utils.audio import mel_spectrogram
 from matcha.utils.model import fix_len_compatibility, normalize
 from matcha.utils.utils import intersperse
 
-
+# adapted from : https://github.com/RVC-Project/Retrieval-based-Voice-Conversion
+# add license, credit
 class SSLFeatureExtractor:
     def __init__(self, vec_path="/content/drive/MyDrive/Models/placeWhereYourFeatureExtractorLives.onnx", device=None):
         print("load model(s) from {}".format(vec_path))
@@ -40,6 +41,72 @@ class SSLFeatureExtractor:
         onnx_input = {self.model.get_inputs()[0].name: feats}
         logits = self.model.run(None, onnx_input)[0]
         return logits.transpose(0, 2, 1)
+
+class RMVPEOnnxPitchExtractor:
+
+    def __init__(self, file: str, threshold: float = 0.03):
+        self.file = file
+        self.f0_min = 50
+        self.f0_max = 1100
+        self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
+        self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
+        self.threshold = threshold
+        self.model = onnxruntime.InferenceSession(file, providers=["CPUExecutionProvider"])
+
+    def extract(self, audio, pitchf, f0_up_key, sr, window, silence_front=0):
+        try:
+            # Data conversion
+            if not isinstance(audio, np.ndarray):
+                audio = audio.cpu().numpy()
+
+            if not isinstance(pitchf, np.ndarray):
+                pitchf = pitchf.cpu().numpy().astype(np.float32)
+
+            if audio.ndim != 1:
+                raise RuntimeError(f"Exception in {self.__class__.__name__}: audio.ndim is not 1 (size: {audio.ndim}, shape: {audio.shape})")
+
+            if pitchf.ndim != 1:
+                raise RuntimeError(f"Exception in {self.__class__.__name__}: pitchf.ndim is not 1 (size: {pitchf.ndim}, shape: {pitchf.shape})")
+
+
+            # silenceFrontFrame = silence_front * sr
+            # startWindow = int(silenceFrontFrame / window)
+            # silenceFrontFrameOffset = startWindow * window
+            # targetFrameLength = len(audio) - silenceFrontFrameOffset
+            minimumFrames = 0.01 * sr
+            # targetFrameLength = max(minimumFrames, targetFrameLength)
+            # print(targetFrameLength)
+            targetFrameLength = int(minimumFrames)
+            # print(audio.size)
+            audio = audio[targetFrameLength:]
+            audio = np.expand_dims(audio, axis=0)
+            # print(audio.size)
+
+            output = self.model.run(
+                ["f0","uv"],
+                {
+                    "waveform": audio.astype(np.float32),
+                    "threshold": np.array([self.threshold]).astype(np.float32),
+                }
+            )
+
+            # print("out size", len(output))
+
+            f0 = output[0].squeeze()
+            f0 *= pow(2, f0_up_key / 12)
+            pitchf[-f0.shape[0]:] = f0[:pitchf.shape[0]]
+
+            f0_mel = 1127.0 * np.log(1.0 + pitchf / 700.0)
+            f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * 254 / (self.f0_mel_max - self.f0_mel_min) + 1
+            f0_mel[f0_mel <= 1] = 1
+            f0_mel[f0_mel > 255] = 255
+            f0_coarse = np.rint(f0_mel).astype(int)
+
+        except Exception as e:
+            raise RuntimeError(f"Exception in {self.__class__.__name__}", e)
+
+        return f0_coarse, pitchf
+
 
 def parse_filelist(filelist_path, split_char="|"):
     with open(filelist_path, encoding="utf-8") as f:

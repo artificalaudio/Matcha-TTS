@@ -138,6 +138,79 @@ def to_waveform(mel, vocoder, denoiser=None):
 
     return audio.cpu().squeeze()
 
+# So to synthesise from NSF matcha, you would need three components; the hubert embeddings, the pitch coarse and fine.
+# Maybe this can be inferred from spectrogram via a different way, and not trained exactly? 
+# Either way that's what we need. There's no F0 models, that might be worth checking out as well. 
+def to_waveform_nsf(hubert_embeddings, f0_float, f0_int):
+    # set flag, or handle if vocoder has been set to NSF return that method. handle for encoderc as well here?
+    # think of something better than if NSF else vocode via HIFIGan, NSF needs: 
+    # Speaker ID, F0, Feature Embeddings, size of features, and RND array, 
+    # RND array can be baked, feature size inferred, speaker is fixed. F0 + Embeddings change. Not simple to directly swap for Mel.  
+    nsf = NSFHead("pathtohead.onnx", 40000, "cpu")
+    
+    audio = nsf.inference(40000, hubert_embeddings, f0_float, f0_int)
+    # if denoiser is not None:
+    #     audio = denoiser(audio.squeeze(), strength=0.00025).cpu().squeeze()
+
+    return audio.cpu().squeeze()
+
+
+class NSFHead:
+    def __init__(
+        self,
+        model_path,
+        sr=40000,
+        device="cpu"
+    ):
+        if device == "cpu" or device is None:
+            providers = ["CPUExecutionProvider"]
+        else:
+            raise RuntimeError("Unsportted Device")
+        self.model = onnxruntime.InferenceSession(model_path, providers=providers)
+        self.sampling_rate = sr
+
+    def forward(self, hubert, hubert_length, pitch, pitchf, ds, rnd):
+        onnx_input = {
+            self.model.get_inputs()[0].name: hubert,
+            self.model.get_inputs()[1].name: hubert_length,
+            self.model.get_inputs()[2].name: pitch,
+            self.model.get_inputs()[3].name: pitchf,
+            self.model.get_inputs()[4].name: ds,
+            self.model.get_inputs()[5].name: rnd,
+        }
+        return (self.model.run(None, onnx_input)[0] * 32767).astype(np.int16)
+
+    def inference(
+      self,
+      sr,
+      hubertIn=None,
+      pitchfIn=None,
+      pitchIIn=None,
+    ):
+      sid = 1
+      hubert = hubertIn
+      hubert = np.repeat(hubert, 2, axis=2).transpose(0, 2, 1).astype(np.float32)
+      hubert_length = hubert.shape[1]
+
+      pitch = pitchIIn
+      pitchf = pitchfIn
+
+      pitch = pitch.astype(np.int64)
+      pitchf = pitchf.astype(np.float32)
+
+      # Reshape pitch and pitchf to 2D with one row
+      pitchf = pitchf[np.newaxis, :].reshape(1, -1)
+      pitch = pitch[np.newaxis, :].reshape(1, -1)
+
+      ds = np.array([sid]).astype(np.int64)
+      rnd = np.random.randn(1, 192, hubert_length).astype(np.float32)
+      hubert_length = np.array([hubert_length]).astype(np.int64)
+
+      out_wav = self.forward(hubert, hubert_length, pitch, pitchf, ds, rnd)
+      out_wav = out_wav.squeeze()
+
+      return out_wav[0:]
+
 
 def save_to_folder(filename: str, output: dict, folder: str):
     folder = Path(folder)

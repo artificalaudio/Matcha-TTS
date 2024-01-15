@@ -9,7 +9,7 @@ _target_: matcha.models.matcha_tts.MatchaTTS
 n_vocab: 178
 n_spks: ${data.n_spks}
 spk_emb_dim: 64
-n_feats: 80
+n_feats: 256 # changed from 80 to experiment with SSL representations instead. 
 data_statistics: ${data.data_statistics}
 out_size: null # Must be divisible by 4
 prior_loss: true

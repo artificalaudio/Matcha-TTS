@@ -20,11 +20,13 @@ from matcha.utils.utils import assert_model_downloaded, get_user_data_dir, inter
 MATCHA_URLS = {
     "matcha_ljspeech": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/matcha_ljspeech.ckpt",
     "matcha_vctk": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/matcha_vctk.ckpt",
+    "matcha_SSL_ljspeech": "https://theplacewithyour/pretrainedCheckpoint.ckpt"
 }
 
 VOCODER_URLS = {
     "hifigan_T2_v1": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/generator_v1",  # Old url: https://drive.google.com/file/d/14NENd4equCBLyyCSke114Mv6YR_j_uFs/view?usp=drive_link
     "hifigan_univ_v1": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/g_02500000",  # Old url: https://drive.google.com/file/d/1qpgI41wNXFcH-iKq1Y42JlBC9j0je8PW/view?usp=drive_link
+    "NeuralSourceVocoder": "https://theplacewithyourNeuralSourceFilterVocoder"
 }
 
 MULTISPEAKER_MODEL = {
@@ -32,6 +34,8 @@ MULTISPEAKER_MODEL = {
 }
 
 SINGLESPEAKER_MODEL = {"matcha_ljspeech": {"vocoder": "hifigan_T2_v1", "speaking_rate": 0.95, "spk": None}}
+
+SLL_NSF_MODEL = {"matcha_SSL_ljspeech": {"vocoder": "NeuralSourceVocoder", "speaking_rate": 0.95, "spk": None}}
 
 
 def plot_spectrogram_to_numpy(spectrogram, filename):
@@ -89,18 +93,27 @@ def load_hifigan(checkpoint_path, device):
     hifigan.remove_weight_norm()
     return hifigan
 
+def load_NSF(checkpoint_path, device):
+    h = AttrDict(v1) # Do this properly and actually load a model here. 
+    NSFVocoder = NSFVocoder #HiFiGAN(h).to(device)
+    NSFVocoder.load_state_dict(torch.load(checkpoint_path, map_location=device)["generator"])
+    # _ = NSFVocoder.eval()
+    # NSFVocoder.remove_weight_norm()
+    return NSFVocoder
+
 
 def load_vocoder(vocoder_name, checkpoint_path, device):
     print(f"[!] Loading {vocoder_name}!")
     vocoder = None
     if vocoder_name in ("hifigan_T2_v1", "hifigan_univ_v1"):
         vocoder = load_hifigan(checkpoint_path, device)
+    if vocoder_name in ("NeuralSourceVocoder"):
+        vocoder = load_NSF(checkpoint_path, device)
     else:
         raise NotImplementedError(
             f"Vocoder {vocoder_name} not implemented! define a load_<<vocoder_name>> method for it"
         )
-
-    denoiser = Denoiser(vocoder, mode="zeros")
+    denoiser = Denoiser(vocoder, mode="zeros") # is denoiser needed for NSF method?
     print(f"[+] {vocoder_name} loaded!")
     return vocoder, denoiser
 
@@ -115,6 +128,10 @@ def load_matcha(model_name, checkpoint_path, device):
 
 
 def to_waveform(mel, vocoder, denoiser=None):
+    # set flag, or handle if vocoder has been set to NSF return that method. handle for encoderc as well here?
+    # think of something better than if NSF else vocode via HIFIGan, NSF needs: 
+    # Speaker ID, F0, Feature Embeddings, size of features, and RND array, 
+    # RND array can be baked, feature size inferred, speaker is fixed. F0 + Embeddings change. Not simple to directly swap for Mel.  
     audio = vocoder(mel).clamp(-1, 1)
     if denoiser is not None:
         audio = denoiser(audio.squeeze(), strength=0.00025).cpu().squeeze()
@@ -145,6 +162,9 @@ def validate_args(args):
 
         if args.model in MULTISPEAKER_MODEL:
             args = validate_args_for_multispeaker_model(args)
+
+        if args.model in SLL_NSF_MODEL:
+            args = validate_args_for_SLL_model(args) # where/what is this? track this down
     else:
         # When using a custom model
         if args.vocoder != "hifigan_univ_v1":
@@ -200,6 +220,24 @@ def validate_args_for_single_speaker_model(args):
         warn_ = f"[-] Ignoring speaker id {args.spk} for {args.model}"
         warnings.warn(warn_, UserWarning)
         args.spk = SINGLESPEAKER_MODEL[args.model]["spk"]
+
+    return args
+
+def validate_args_for_SLL_model(args):
+    if args.vocoder is not None:
+        if args.vocoder != SLL_NSF_MODEL[args.model]["vocoder"]:
+            warn_ = f"[-] Using {args.model} model! I would suggest passing --vocoder {SINGLESPEAKER_MODEL[args.model]['vocoder']}"
+            warnings.warn(warn_, UserWarning)
+    else:
+        args.vocoder = SLL_NSF_MODEL[args.model]["vocoder"]
+
+    if args.speaking_rate is None:
+        args.speaking_rate = SLL_NSF_MODEL[args.model]["speaking_rate"]
+
+    if args.spk != SLL_NSF_MODEL[args.model]["spk"]:
+        warn_ = f"[-] Ignoring speaker id {args.spk} for {args.model}"
+        warnings.warn(warn_, UserWarning)
+        args.spk = SLL_NSF_MODEL[args.model]["spk"]
 
     return args
 
@@ -335,7 +373,7 @@ def batched_synthesis(args, device, model, vocoder, denoiser, texts, spk):
             length_scale=args.speaking_rate,
         )
 
-        output["waveform"] = to_waveform(output["mel"], vocoder, denoiser)
+        output["waveform"] = to_waveform(output["mel"], vocoder, denoiser) # if encodec, or if NSF/SLL do different here?
         t = (dt.datetime.now() - start_t).total_seconds()
         rtf_w = t * 22050 / (output["waveform"].shape[-1])
         print(f"[🍵-Batch: {i}] Matcha-TTS RTF: {output['rtf']:.4f}")

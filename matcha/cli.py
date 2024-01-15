@@ -92,7 +92,7 @@ def load_hifigan(checkpoint_path, device):
     _ = hifigan.eval()
     hifigan.remove_weight_norm()
     return hifigan
-
+# load nsf main object here instead?
 def load_NSF(checkpoint_path, device):
     h = AttrDict(v1) # Do this properly and actually load a model here. 
     NSFVocoder = NSFVocoder #HiFiGAN(h).to(device)
@@ -108,7 +108,7 @@ def load_vocoder(vocoder_name, checkpoint_path, device):
     if vocoder_name in ("hifigan_T2_v1", "hifigan_univ_v1"):
         vocoder = load_hifigan(checkpoint_path, device)
     if vocoder_name in ("NeuralSourceVocoder"):
-        vocoder = load_NSF(checkpoint_path, device)
+        vocoder = load_NSF(checkpoint_path, device) # Not a checkpoint path, or does it even matter, just pass in onnx model path if nsf, should work
     else:
         raise NotImplementedError(
             f"Vocoder {vocoder_name} not implemented! define a load_<<vocoder_name>> method for it"

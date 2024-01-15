@@ -165,8 +165,12 @@ class TextMelDataset(torch.utils.data.Dataset):
             spk = None
 
         text = self.get_text(text, add_blank=self.add_blank)
+        # if mel OG method do this:
         mel = self.get_mel(filepath)
-
+        #if SSL method do this:
+        # mel = self.get_ssl(filepath) # kinda lazy, just overridding mel and not being descriptive. Could change var Mel for reps (representations?)
+        # if Encodec method, do this etc...
+        # reps = encodec.decode balah blah
         return {"x": text, "y": mel, "spk": spk}
 
     def get_mel(self, filepath):
@@ -185,6 +189,26 @@ class TextMelDataset(torch.utils.data.Dataset):
         ).squeeze()
         mel = normalize(mel, self.data_parameters["mel_mean"], self.data_parameters["mel_std"])
         return mel
+
+    def get_ssl(self, filepath):
+        audio, sr = ta.load(filepath)
+        assert sr == self.sample_rate
+        # Resample to 16khz, feed through model, return vec of (Frames X 256), where frame is 10ms.
+        # these are stand in functions for now, just trying to get a feel for what needs to happen/change.
+        ssl = SSLFeatureExtractor(audio
+        ).squeeze()
+        #ssl = normalize(mel, self.data_parameters["mel_mean"], self.data_parameters["mel_std"])
+        return ssl
+
+    def get_ssl_F0(self, filepath):
+        audio, sr = ta.load(filepath)
+        assert sr == self.sample_rate
+        # Resample to 16khz, feed through model, return vec of (Frames X 256), where frame is 10ms.
+        ssl = SSLFeatureExtractor(audio
+        ).squeeze()
+        #ssl = normalize(mel, self.data_parameters["mel_mean"], self.data_parameters["mel_std"])
+        F0 = F0featureExtractor(audio)
+        return ssl, F0
 
     def get_text(self, text, add_blank=True):
         text_norm = text_to_sequence(text, self.cleaners)

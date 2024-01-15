@@ -18,6 +18,7 @@ from matcha.utils.utils import intersperse
 
 # adapted from : https://github.com/RVC-Project/Retrieval-based-Voice-Conversion
 # add license, credit
+# this also assumes you want the final projection layer, which according to ghenter (add reference to the two papers on SSL sponteaounous speech), you would want to use other intermediate feature layers. 
 class SSLFeatureExtractor:
     def __init__(self, vec_path="/content/drive/MyDrive/Models/placeWhereYourFeatureExtractorLives.onnx", device=None):
         print("load model(s) from {}".format(vec_path))

@@ -10,7 +10,7 @@ import soundfile as sf
 import torch
 import onnxruntime 
 
-from scipy.interpolate import interp1d
+# from scipy.interpolate import interp1d
 
 from matcha.hifigan.config import v1
 from matcha.hifigan.denoiser import Denoiser

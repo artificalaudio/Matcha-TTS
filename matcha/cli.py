@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 import torch
+import onnxruntime 
+
+from scipy.interpolate import interp1d
 
 from matcha.hifigan.config import v1
 from matcha.hifigan.denoiser import Denoiser
@@ -20,23 +23,84 @@ from matcha.utils.utils import assert_model_downloaded, get_user_data_dir, inter
 MATCHA_URLS = {
     "matcha_ljspeech": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/matcha_ljspeech.ckpt",
     "matcha_vctk": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/matcha_vctk.ckpt",
-    "matcha_SSL_ljspeech": "https://theplacewithyour/pretrainedCheckpoint.ckpt"
 }
 
 VOCODER_URLS = {
     "hifigan_T2_v1": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/generator_v1",  # Old url: https://drive.google.com/file/d/14NENd4equCBLyyCSke114Mv6YR_j_uFs/view?usp=drive_link
     "hifigan_univ_v1": "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/g_02500000",  # Old url: https://drive.google.com/file/d/1qpgI41wNXFcH-iKq1Y42JlBC9j0je8PW/view?usp=drive_link
-    "NeuralSourceVocoder": "https://theplacewithyourNeuralSourceFilterVocoder"
 }
 
 MULTISPEAKER_MODEL = {
     "matcha_vctk": {"vocoder": "hifigan_univ_v1", "speaking_rate": 0.85, "spk": 0, "spk_range": (0, 107)}
 }
 
+# not finished don't use this yet
 SINGLESPEAKER_MODEL = {"matcha_ljspeech": {"vocoder": "hifigan_T2_v1", "speaking_rate": 0.95, "spk": None}}
 
-SLL_NSF_MODEL = {"matcha_SSL_ljspeech": {"vocoder": "NeuralSourceVocoder", "speaking_rate": 0.95, "spk": None}}
 
+class NSFHead:
+    def __init__(
+        self,
+        model_path,
+        sr=40000,
+        device="cpu"
+    ):
+        if device == "cpu" or device is None:
+            providers = ["CPUExecutionProvider"]
+        else:
+            raise RuntimeError("Unsportted Device")
+        self.model = onnxruntime.InferenceSession(model_path, providers=providers)
+        self.sampling_rate = sr
+
+    def forward(self, hubert, hubert_length, pitch, pitchf, ds, rnd):
+        onnx_input = {
+            self.model.get_inputs()[0].name: hubert,
+            self.model.get_inputs()[1].name: hubert_length,
+            self.model.get_inputs()[2].name: pitch,
+            self.model.get_inputs()[3].name: pitchf,
+            self.model.get_inputs()[4].name: ds,
+            self.model.get_inputs()[5].name: rnd,
+        }
+        return (self.model.run(None, onnx_input)[0] * 32767).astype(np.int16)
+
+    def inference(
+      self,
+      hubertIn=None,
+      pitchfIn=None,
+      pitchIIn=None,
+    ):
+
+      sr = 40000
+      sid = 0
+      hubert = hubertIn
+      # hubert = np.repeat(hubert, 2, axis=2).transpose(0, 2, 1).astype(np.float32)
+      hubert_length = hubert.shape[1]
+
+      pitch = pitchIIn
+      pitchf = pitchfIn
+
+      pitch = pitch.astype(np.int64)
+      pitchf = pitchf.astype(np.float32)
+
+      # # Reshape pitch and pitchf to 2D with one row
+      # pitchf = pitchf[np.newaxis, :].reshape(1, -1)
+      # pitch = pitch[np.newaxis, :].reshape(1, -1)
+
+      ds = np.array([sid]).astype(np.int64)
+      rnd = np.random.randn(1, 192, hubert_length).astype(np.float32)
+      hubert_length = np.array([hubert_length]).astype(np.int64)
+
+      print("hubert shape: ",hubert.shape)
+      print("hubert length: ",hubert_length)
+      print("pitch shape: ",pitch.shape)
+      print("pitchf shape: ",pitchf.shape)
+      print("ds shape: ",ds.shape)
+      print("rnd shape: ",rnd.shape)
+
+      out_wav = self.forward(hubert, hubert_length, pitch, pitchf, ds, rnd)
+      out_wav = out_wav.squeeze()
+
+      return out_wav[0:]
 
 def plot_spectrogram_to_numpy(spectrogram, filename):
     fig, ax = plt.subplots(figsize=(12, 3))
@@ -92,14 +156,6 @@ def load_hifigan(checkpoint_path, device):
     _ = hifigan.eval()
     hifigan.remove_weight_norm()
     return hifigan
-# load nsf main object here instead?
-def load_NSF(checkpoint_path, device):
-    h = AttrDict(v1) # Do this properly and actually load a model here. 
-    NSFVocoder = NSFVocoder #HiFiGAN(h).to(device)
-    NSFVocoder.load_state_dict(torch.load(checkpoint_path, map_location=device)["generator"])
-    # _ = NSFVocoder.eval()
-    # NSFVocoder.remove_weight_norm()
-    return NSFVocoder
 
 
 def load_vocoder(vocoder_name, checkpoint_path, device):
@@ -107,13 +163,12 @@ def load_vocoder(vocoder_name, checkpoint_path, device):
     vocoder = None
     if vocoder_name in ("hifigan_T2_v1", "hifigan_univ_v1"):
         vocoder = load_hifigan(checkpoint_path, device)
-    if vocoder_name in ("NeuralSourceVocoder"):
-        vocoder = load_NSF(checkpoint_path, device) # Not a checkpoint path, or does it even matter, just pass in onnx model path if nsf, should work
-    else:
-        raise NotImplementedError(
-            f"Vocoder {vocoder_name} not implemented! define a load_<<vocoder_name>> method for it"
-        )
-    denoiser = Denoiser(vocoder, mode="zeros") # is denoiser needed for NSF method?
+    # else:
+        # raise NotImplementedError(
+            # f"Vocoder {vocoder_name} not implemented! define a load_<<vocoder_name>> method for it"
+        # )
+
+    denoiser = Denoiser(vocoder, mode="zeros")
     print(f"[+] {vocoder_name} loaded!")
     return vocoder, denoiser
 
@@ -126,90 +181,129 @@ def load_matcha(model_name, checkpoint_path, device):
     print(f"[+] {model_name} loaded!")
     return model
 
+def load_F0(device):
+    checkpoint_path = "/content/drive/MyDrive/SSLMatchaProject/Matcha-TTS/logs/train/ljspeech/runs/2024-01-22_15-28-54/checkpoints/checkpoint_epoch=394.ckpt"
+    f0model = MatchaTTS.load_from_checkpoint(checkpoint_path, map_location=device)
+    _ = f0model.eval()
 
-def to_waveform(mel, vocoder, denoiser=None):
-    # set flag, or handle if vocoder has been set to NSF return that method. handle for encoderc as well here?
-    # think of something better than if NSF else vocode via HIFIGan, NSF needs: 
-    # Speaker ID, F0, Feature Embeddings, size of features, and RND array, 
-    # RND array can be baked, feature size inferred, speaker is fixed. F0 + Embeddings change. Not simple to directly swap for Mel.  
-    audio = vocoder(mel).clamp(-1, 1)
-    if denoiser is not None:
-        audio = denoiser(audio.squeeze(), strength=0.00025).cpu().squeeze()
+    print("f0 model loaded!")
+    return f0model
 
-    return audio.cpu().squeeze()
+# def to_f0(finput):
 
-# So to synthesise from NSF matcha, you would need three components; the hubert embeddings, the pitch coarse and fine.
-# Maybe this can be inferred from spectrogram via a different way, and not trained exactly? 
-# Either way that's what we need. There's no F0 models, that might be worth checking out as well. 
-def to_waveform_nsf(hubert_embeddings, f0_float, f0_int):
-    # set flag, or handle if vocoder has been set to NSF return that method. handle for encoderc as well here?
-    # think of something better than if NSF else vocode via HIFIGan, NSF needs: 
-    # Speaker ID, F0, Feature Embeddings, size of features, and RND array, 
-    # RND array can be baked, feature size inferred, speaker is fixed. F0 + Embeddings change. Not simple to directly swap for Mel.  
-    nsf = NSFHead("pathtohead.onnx", 40000, "cpu")
+def to_waveform(mel):
+    # nsfhead = NSFHead()
+    f0_min = 50
+    f0_max = 1100
+    f0_mel_min = 1127 * np.log(1 + f0_min / 700)
+    f0_mel_max = 1127 * np.log(1 + f0_max / 700)
+
+    hubert = mel.numpy()
+    print("hubert shape before repeat", hubert.shape)
+    hubert = np.repeat(hubert, 2, axis=2).transpose(0, 2, 1).astype(np.float32)
     
-    audio = nsf.inference(40000, hubert_embeddings, f0_float, f0_int)
-    # if denoiser is not None:
-    #     audio = denoiser(audio.squeeze(), strength=0.00025).cpu().squeeze()
+    
+    print("hubert shape", hubert.shape)
+    hubert_length = hubert.shape[1]
+    print("hubert length", hubert_length)
 
-    return audio.cpu().squeeze()
+    f0_up_key = 0
+    pitchf = np.full(hubert_length, 220)
+    # pitchf_np = pitchf.cpu().numpy()
+
+    # just ignore this tried a F0 model, but pitch readings were messed on dataset, 
+    # tried to squiggle before I realised
+    # reduced_f0 = pitchIn.squeeze(0)  # Now the shape is [2, 901]
+
+    # # Flatten the tensor to a 1D tensor using .reshape(-1) instead of .view(-1)
+    # flattened_f0 = reduced_f0.reshape(-1)  # Now the shape is [1802]
+
+    # # Truncate flattened_f0 to match hubert_length
+    # flattened_f0 = flattened_f0[:hubert_length]
+
+    # # Convert flattened_f0 to a numpy array if necessary
+    # extractedf0 = flattened_f0.cpu().numpy()
 
 
-class NSFHead:
-    def __init__(
-        self,
-        model_path,
-        sr=40000,
-        device="cpu"
-    ):
-        if device == "cpu" or device is None:
-            providers = ["CPUExecutionProvider"]
-        else:
-            raise RuntimeError("Unsportted Device")
-        self.model = onnxruntime.InferenceSession(model_path, providers=providers)
-        self.sampling_rate = sr
+    # reduced_f0 = pitchIn.squeeze(0)  # Now the shape is [2, 901]
 
-    def forward(self, hubert, hubert_length, pitch, pitchf, ds, rnd):
-        onnx_input = {
-            self.model.get_inputs()[0].name: hubert,
-            self.model.get_inputs()[1].name: hubert_length,
-            self.model.get_inputs()[2].name: pitch,
-            self.model.get_inputs()[3].name: pitchf,
-            self.model.get_inputs()[4].name: ds,
-            self.model.get_inputs()[5].name: rnd,
-        }
-        return (self.model.run(None, onnx_input)[0] * 32767).astype(np.int16)
+    # # Extract the first row
+    # first_row = reduced_f0[0, :]
 
-    def inference(
-      self,
-      sr,
-      hubertIn=None,
-      pitchfIn=None,
-      pitchIIn=None,
-    ):
-      sid = 1
-      hubert = hubertIn
-      hubert = np.repeat(hubert, 2, axis=2).transpose(0, 2, 1).astype(np.float32)
-      hubert_length = hubert.shape[1]
+    # # Extract the second row for interpolation
+    # second_row = reduced_f0[1, :].cpu().numpy()  # Convert to numpy for interpolation
 
-      pitch = pitchIIn
-      pitchf = pitchfIn
+    # # Create an interpolation function
+    # x_old = np.linspace(0, 1, second_row.shape[0])
+    # x_new = np.linspace(0, 1, hubert_length)
+    # interpolation_function = interp1d(x_old, second_row, kind='linear')
 
-      pitch = pitch.astype(np.int64)
-      pitchf = pitchf.astype(np.float32)
+    # # Interpolate the second row to match hubert_length
+    # interpolated_second_row = interpolation_function(x_new)
 
-      # Reshape pitch and pitchf to 2D with one row
-      pitchf = pitchf[np.newaxis, :].reshape(1, -1)
-      pitch = pitch[np.newaxis, :].reshape(1, -1)
+    # # Convert the interpolated_second_row back to a PyTorch tensor
+    # interpolated_second_row_tensor = torch.tensor(interpolated_second_row, dtype=torch.float)
 
-      ds = np.array([sid]).astype(np.int64)
-      rnd = np.random.randn(1, 192, hubert_length).astype(np.float32)
-      hubert_length = np.array([hubert_length]).astype(np.int64)
 
-      out_wav = self.forward(hubert, hubert_length, pitch, pitchf, ds, rnd)
-      out_wav = out_wav.squeeze()
+    # # Assign extractedf0 to pitchf
+    # pitchf = interpolated_second_row_tensor.numpy()
 
-      return out_wav[0:]
+
+
+    # reduced_f0 = pitchIn.squeeze(0)  # Now the shape is [2, 901]
+
+    # # Extract the first row
+    # first_row = reduced_f0[1, :]
+
+    # # Calculate the length to take and the length to pad
+    # take_length = hubert_length // 2  # Integer division to get half of hubert_length
+    # pad_length = hubert_length - take_length
+
+    # # Take the first hubert_length/2 of embeddings from first_row
+    # taken_first_row = first_row[:take_length]
+
+    # # Pad the rest with zeros to match hubert_length
+    # padded_first_row = torch.nn.functional.pad(taken_first_row, (0, pad_length), 'constant', 0)
+    # pitchf = padded_first_row.numpy()
+
+    # print("pitchf shape",pitchf.shape) # Display the shape and the tensor itself to verify
+
+    # print("pitchf before scaling:")
+    # print(pitchf)
+# Now you can use the .copy() method on the numpy array
+    
+    pitchf = pitchf * 2 ** (f0_up_key / 12)
+    pitch = pitchf.copy()
+    # print("pitchf after scaling:")
+    # print(pitchf)
+    # pitch = pitchf.copy()
+    f0_mel = 1127 * np.log(1 + pitch / 700)
+    # print("f0_mel before adjustments:")
+    # print(f0_mel)
+    f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * 254 / (
+        f0_mel_max - f0_mel_min
+    ) + 1
+    f0_mel[f0_mel <= 1] = 1
+    f0_mel[f0_mel > 255] = 255
+    # print("f0_mel after adjustments:")
+    # print(f0_mel)
+    pitch = np.rint(f0_mel).astype(np.int64)
+
+    # print("pitch int:")
+    print(pitch.size)
+    pitchf = pitchf.reshape(1, len(pitchf)).astype(np.float32)
+    pitch = pitch.reshape(1, len(pitch))
+
+    print("pitchf shape",pitch.shape)
+    # needs to be 256 models for now. I will train on 768, just checking it works. 
+    model_path = "/content/drive/MyDrive/Models/kiki.onnx"
+    sr = 40000
+    nsfhead = NSFHead(
+    model_path, sr=sr, device="cpu"
+)
+    audio = nsfhead.inference(hubert, pitchf, pitch)
+
+    return audio.squeeze()
 
 
 def save_to_folder(filename: str, output: dict, folder: str):
@@ -217,7 +311,7 @@ def save_to_folder(filename: str, output: dict, folder: str):
     folder.mkdir(exist_ok=True, parents=True)
     plot_spectrogram_to_numpy(np.array(output["mel"].squeeze().float().cpu()), f"{filename}.png")
     np.save(folder / f"{filename}", output["mel"].cpu().numpy())
-    sf.write(folder / f"{filename}.wav", output["waveform"], 22050, "PCM_24")
+    sf.write(folder / f"{filename}.wav", output["waveform"], 40000, "PCM_24")
     return folder.resolve() / f"{filename}.wav"
 
 
@@ -235,9 +329,6 @@ def validate_args(args):
 
         if args.model in MULTISPEAKER_MODEL:
             args = validate_args_for_multispeaker_model(args)
-
-        if args.model in SLL_NSF_MODEL:
-            args = validate_args_for_SLL_model(args) # where/what is this? track this down
     else:
         # When using a custom model
         if args.vocoder != "hifigan_univ_v1":
@@ -293,24 +384,6 @@ def validate_args_for_single_speaker_model(args):
         warn_ = f"[-] Ignoring speaker id {args.spk} for {args.model}"
         warnings.warn(warn_, UserWarning)
         args.spk = SINGLESPEAKER_MODEL[args.model]["spk"]
-
-    return args
-
-def validate_args_for_SLL_model(args):
-    if args.vocoder is not None:
-        if args.vocoder != SLL_NSF_MODEL[args.model]["vocoder"]:
-            warn_ = f"[-] Using {args.model} model! I would suggest passing --vocoder {SINGLESPEAKER_MODEL[args.model]['vocoder']}"
-            warnings.warn(warn_, UserWarning)
-    else:
-        args.vocoder = SLL_NSF_MODEL[args.model]["vocoder"]
-
-    if args.speaking_rate is None:
-        args.speaking_rate = SLL_NSF_MODEL[args.model]["speaking_rate"]
-
-    if args.spk != SLL_NSF_MODEL[args.model]["spk"]:
-        warn_ = f"[-] Ignoring speaker id {args.spk} for {args.model}"
-        warnings.warn(warn_, UserWarning)
-        args.spk = SLL_NSF_MODEL[args.model]["spk"]
 
     return args
 
@@ -389,15 +462,18 @@ def cli():
         args.model = "custom_model"
 
     model = load_matcha(args.model, paths["matcha"], device)
-    vocoder, denoiser = load_vocoder(args.vocoder, paths["vocoder"], device)
+    # need to not load hifigan at all
+    # vocoder, denoiser = load_vocoder(args.vocoder, paths["vocoder"], device)
 
     texts = get_texts(args)
 
     spk = torch.tensor([args.spk], device=device, dtype=torch.long) if args.spk is not None else None
     if len(texts) == 1 or not args.batched:
-        unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk)
-    else:
-        batched_synthesis(args, device, model, vocoder, denoiser, texts, spk)
+        # unbatched_F0_synthesis(args, device, f0model, texts, spk)
+        # unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk)
+        unbatched_synthesis_nsf(args, device, model, texts, spk)
+    # else:
+    #     batched_synthesis(args, device, model, vocoder, denoiser, texts, spk)
 
 
 class BatchedSynthesisDataset(torch.utils.data.Dataset):
@@ -446,7 +522,7 @@ def batched_synthesis(args, device, model, vocoder, denoiser, texts, spk):
             length_scale=args.speaking_rate,
         )
 
-        output["waveform"] = to_waveform(output["mel"], vocoder, denoiser) # if encodec, or if NSF/SLL do different here?
+        output["waveform"] = to_waveform(output["mel"], vocoder, denoiser)
         t = (dt.datetime.now() - start_t).total_seconds()
         rtf_w = t * 22050 / (output["waveform"].shape[-1])
         print(f"[🍵-Batch: {i}] Matcha-TTS RTF: {output['rtf']:.4f}")
@@ -487,7 +563,21 @@ def unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk):
             spks=spk,
             length_scale=args.speaking_rate,
         )
-        output["waveform"] = to_waveform(output["mel"], vocoder, denoiser)
+
+        f0model = load_F0(device)
+
+        output_f0 = f0model.synthesise(
+            text_processed["x"],
+            text_processed["x_lengths"],
+            n_timesteps=args.steps,
+            temperature=args.temperature,
+            spks=spk,
+            length_scale=args.speaking_rate,
+        )
+
+        print("shape of f0 output:", output_f0["mel"].shape)
+
+        output["waveform"] = to_waveform(output["mel"], vocoder, output_f0["mel"])
         # RTF with HiFiGAN
         t = (dt.datetime.now() - start_t).total_seconds()
         rtf_w = t * 22050 / (output["waveform"].shape[-1])
@@ -504,6 +594,96 @@ def unbatched_synthesis(args, device, model, vocoder, denoiser, texts, spk):
     print(f"[🍵] Average Matcha-TTS + VOCODER RTF: {np.mean(total_rtf_w):.4f} ± {np.std(total_rtf_w)}")
     print("[🍵] Enjoy the freshly whisked 🍵 Matcha-TTS!")
 
+
+def unbatched_synthesis_nsf(args, device, model, texts, spk):
+    total_rtf = []
+    total_rtf_w = []
+    for i, text in enumerate(texts):
+        i = i + 1
+        base_name = f"utterance_{i:03d}_speaker_{args.spk:03d}" if args.spk is not None else f"utterance_{i:03d}"
+
+        print("".join(["="] * 100))
+        text = text.strip()
+        text_processed = process_text(i, text, device)
+
+        print(f"[🍵] Whisking Matcha-T(ea)TS for: {i}")
+        start_t = dt.datetime.now()
+        output = model.synthesise(
+            text_processed["x"],
+            text_processed["x_lengths"],
+            n_timesteps=args.steps,
+            temperature=args.temperature,
+            spks=spk,
+            length_scale=args.speaking_rate,
+        )
+
+        # f0model = load_F0(device)
+
+        # output_f0 = f0model.synthesise(
+        #     text_processed["x"],
+        #     text_processed["x_lengths"],
+        #     n_timesteps=args.steps,
+        #     temperature=args.temperature,
+        #     spks=spk,
+        #     length_scale=args.speaking_rate,
+        # )
+
+        # print("shape of f0 output:", output_f0["mel"].shape)
+
+        output["waveform"] = to_waveform(output["mel"])
+        # RTF with HiFiGAN
+        t = (dt.datetime.now() - start_t).total_seconds()
+        rtf_w = t * 22050 / (output["waveform"].shape[-1])
+        print(f"[🍵-{i}] Matcha-TTS RTF: {output['rtf']:.4f}")
+        print(f"[🍵-{i}] Matcha-TTS + VOCODER RTF: {rtf_w:.4f}")
+        total_rtf.append(output["rtf"])
+        total_rtf_w.append(rtf_w)
+
+        location = save_to_folder(base_name, output, args.output_folder)
+        print(f"[+] Waveform saved: {location}")
+
+    print("".join(["="] * 100))
+    print(f"[🍵] Average Matcha-TTS RTF: {np.mean(total_rtf):.4f} ± {np.std(total_rtf)}")
+    print(f"[🍵] Average Matcha-TTS + VOCODER RTF: {np.mean(total_rtf_w):.4f} ± {np.std(total_rtf_w)}")
+    print("[🍵] Enjoy the freshly whisked 🍵 Matcha-TTS!")
+
+def unbatched_F0_synthesis(args, device, model, texts, spk):
+    total_rtf = []
+    total_rtf_w = []
+    for i, text in enumerate(texts):
+        i = i + 1
+        base_name = f"utterance_{i:03d}_speaker_{args.spk:03d}" if args.spk is not None else f"utterance_{i:03d}"
+
+        print("".join(["="] * 100))
+        text = text.strip()
+        text_processed = process_text(i, text, device)
+
+        print(f"[🍵] Whisking Matcha-T(ea)TS for: {i}")
+        start_t = dt.datetime.now()
+        output = model.synthesise(
+            text_processed["x"],
+            text_processed["x_lengths"],
+            n_timesteps=args.steps,
+            temperature=args.temperature,
+            spks=spk,
+            length_scale=args.speaking_rate,
+        )
+        output["waveform"] = to_f0(output["mel"])
+        # RTF with HiFiGAN
+        t = (dt.datetime.now() - start_t).total_seconds()
+        rtf_w = t * 22050 / (output["waveform"].shape[-1])
+        print(f"[🍵-{i}] Matcha-TTS RTF: {output['rtf']:.4f}")
+        print(f"[🍵-{i}] Matcha-TTS + VOCODER RTF: {rtf_w:.4f}")
+        total_rtf.append(output["rtf"])
+        total_rtf_w.append(rtf_w)
+
+        location = save_to_folder(base_name, output, args.output_folder)
+        print(f"[+] Waveform saved: {location}")
+
+    print("".join(["="] * 100))
+    print(f"[🍵] Average Matcha-TTS RTF: {np.mean(total_rtf):.4f} ± {np.std(total_rtf)}")
+    print(f"[🍵] Average Matcha-TTS + VOCODER RTF: {np.mean(total_rtf_w):.4f} ± {np.std(total_rtf_w)}")
+    print("[🍵] Enjoy the freshly whisked 🍵 Matcha-TTS!")
 
 def print_config(args):
     print("[!] Configurations: ")
